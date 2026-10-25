@@ -83,7 +83,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            android:text="3. Buscar y exportar a .txt" />
+            android:text="3. Buscar" />
 
         <Button
             android:id="@+id/btnCancelar"
@@ -107,5 +107,56 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
             android:textSize="15sp" />
+
+        <LinearLayout
+            android:id="@+id/llAcciones"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:orientation="horizontal"
+            android:visibility="gone">
+
+            <Button
+                android:id="@+id/btnGuardar"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Guardar .txt" />
+
+            <Button
+                android:id="@+id/btnDescartar"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Descartar" />
+        </LinearLayout>
+
+        <Button
+            android:id="@+id/btnCopiar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Copiar vista previa"
+            android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/tvPreviaTitulo"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/tvPrevia"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:background="#EEEEEE"
+            android:padding="8dp"
+            android:textIsSelectable="true"
+            android:textSize="12sp"
+            android:typeface="monospace"
+            android:visibility="gone" />
     </LinearLayout>
 </ScrollView>
