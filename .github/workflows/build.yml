@@ -21,6 +21,9 @@ jobs:
         with:
           gradle-version: 8.7
 
+      - name: Preparar clave de firma
+        run: base64 -d app/filtro.jks.b64 > app/filtro.jks
+
       - name: Compilar APK de depuración
         run: gradle assembleDebug
 
