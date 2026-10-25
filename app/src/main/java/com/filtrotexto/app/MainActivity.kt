@@ -1,20 +1,20 @@
 package com.filtrotexto.app
 
+import android.Manifest
 import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.style.BackgroundColorSpan
 import android.view.View
-import android.view.WindowManager
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
@@ -23,43 +23,22 @@ import android.widget.ProgressBar
 import android.widget.RadioButton
 import android.widget.TextView
 import android.widget.Toast
-import java.io.BufferedInputStream
-import java.io.BufferedReader
-import java.io.BufferedWriter
-import java.io.File
-import java.io.FilterInputStream
-import java.io.IOException
-import java.io.InputStream
-import java.io.InputStreamReader
-import java.io.OutputStreamWriter
 import java.text.NumberFormat
-import kotlin.concurrent.thread
 
 /**
- * Filtro de texto para archivos grandes.
+ * Pantalla del Filtro de Texto.
  *
- * - Lee el archivo línea por línea (streaming), por lo que casi no usa memoria
- *   aunque el archivo pese varios GB.
- * - Los resultados se guardan primero en un archivo temporal y se muestra una
- *   vista previa; recién al tocar "Guardar .txt" se exportan.
- * - Recibe archivos desde "Compartir" y "Abrir con" de otras apps.
+ * El trabajo pesado (buscar y guardar) lo hace [TrabajoService] en primer plano;
+ * esta pantalla solo muestra el [Estado] y puede cerrarse o reabrirse sin
+ * interrumpir la búsqueda.
  */
 class MainActivity : Activity() {
 
     private companion object {
         const val REQ_ABRIR = 1
         const val REQ_GUARDAR = 2
-        const val PREVIA_MAX = 200
-        const val PREVIA_ANCHO = 400
+        const val REQ_NOTIFICACIONES = 3
     }
-
-    private class Busqueda(
-        val palabras: List<String>,
-        val todas: Boolean,
-        val mayus: Boolean,
-        val excluidas: List<String>,
-        val latin1: Boolean
-    )
 
     private lateinit var btnElegir: Button
     private lateinit var btnBuscar: Button
@@ -74,26 +53,23 @@ class MainActivity : Activity() {
     private lateinit var tvPrevia: TextView
     private lateinit var etBuscar: EditText
     private lateinit var etExcluir: EditText
+    private lateinit var rbCualquiera: RadioButton
     private lateinit var rbTodas: RadioButton
     private lateinit var cbMayus: CheckBox
     private lateinit var cbLatin1: CheckBox
     private lateinit var barra: ProgressBar
 
-    private var archivoUri: Uri? = null
-    private var archivoNombre = ""
-    private var archivoTam = -1L
-
-    private var resultadoTemp: File? = null
-    private var resultadoCoinc = 0L
-
-    @Volatile private var cancelar = false
-    @Volatile private var trabajando = false
+    /** Versión de la vista previa que ya está dibujada (para no rehacerla a cada avance). */
+    private var previaPintada = -1
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        limpiarTemporales()
+        if (!Estado.temporalesLimpiados) {
+            limpiarTemporales()
+            Estado.temporalesLimpiados = true
+        }
 
         btnElegir = findViewById(R.id.btnElegir)
         btnBuscar = findViewById(R.id.btnBuscar)
@@ -108,6 +84,7 @@ class MainActivity : Activity() {
         tvPrevia = findViewById(R.id.tvPrevia)
         etBuscar = findViewById(R.id.etBuscar)
         etExcluir = findViewById(R.id.etExcluir)
+        rbCualquiera = findViewById(R.id.rbCualquiera)
         rbTodas = findViewById(R.id.rbTodas)
         cbMayus = findViewById(R.id.cbMayus)
         cbLatin1 = findViewById(R.id.cbLatin1)
@@ -118,18 +95,29 @@ class MainActivity : Activity() {
         btnGuardar.setOnClickListener { alPulsarGuardar() }
         btnCopiar.setOnClickListener { copiarPrevia() }
         btnDescartar.setOnClickListener {
-            descartarResultado()
-            barra.progress = 0
-            barra.visibility = View.INVISIBLE
-            tvEstado.text = "Resultados descartados."
+            Estado.limpiarResultado()
+            Estado.progreso = 0
+            Estado.mensaje = "Resultados descartados."
+            pintar()
         }
         btnCancelar.setOnClickListener {
-            cancelar = true
-            btnCancelar.isEnabled = false
-            tvEstado.text = "Cancelando…"
+            Estado.cancelar = true
+            Estado.mensaje = "Cancelando…"
+            pintar()
         }
 
         manejarIntent(intent)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        Estado.oyente = { pintar() }
+        pintar()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        Estado.oyente = null
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -138,17 +126,64 @@ class MainActivity : Activity() {
         manejarIntent(intent)
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        if (isFinishing) resultadoTemp?.delete()
+    // ---------------------------------------------------------------- pantalla
+
+    /** Dibuja en pantalla lo que dice el [Estado]. */
+    private fun pintar() {
+        val ocupado = Estado.trabajando
+
+        tvArchivo.text = if (Estado.archivoUri == null) {
+            "Ningún archivo seleccionado"
+        } else {
+            val tam = if (Estado.archivoTam >= 0) " (${formatoTamano(Estado.archivoTam)})" else ""
+            "Archivo cargado: ${Estado.archivoNombre}$tam"
+        }
+
+        btnElegir.isEnabled = !ocupado
+        btnBuscar.isEnabled = !ocupado
+        btnGuardar.isEnabled = !ocupado
+        btnDescartar.isEnabled = !ocupado
+        btnCopiar.isEnabled = !ocupado
+        etBuscar.isEnabled = !ocupado
+        etExcluir.isEnabled = !ocupado
+        cbMayus.isEnabled = !ocupado
+        cbLatin1.isEnabled = !ocupado
+        rbCualquiera.isEnabled = !ocupado
+        rbTodas.isEnabled = !ocupado
+
+        btnCancelar.visibility = if (ocupado) View.VISIBLE else View.GONE
+        btnCancelar.isEnabled = !Estado.cancelar
+
+        barra.visibility = if (ocupado || Estado.progreso > 0) View.VISIBLE else View.INVISIBLE
+        barra.isIndeterminate = ocupado && Estado.indeterminada
+        barra.progress = Estado.progreso
+        tvEstado.text = Estado.mensaje
+
+        val hayResultado = Estado.resultadoTemp != null
+        val visibilidad = if (hayResultado) View.VISIBLE else View.GONE
+        llAcciones.visibility = visibilidad
+        btnCopiar.visibility = visibilidad
+        tvPreviaTitulo.visibility = visibilidad
+        tvPrevia.visibility = visibilidad
+
+        if (hayResultado) {
+            if (previaPintada != Estado.previaVersion) {
+                mostrarPrevia()
+                previaPintada = Estado.previaVersion
+            }
+        } else {
+            previaPintada = -1
+            tvPrevia.text = ""
+        }
     }
 
     // ---------------------------------------------------------------- elegir / recibir archivo
 
     private fun elegirArchivo() {
-        if (trabajando) return
+        if (Estado.trabajando) return
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
             .addCategory(Intent.CATEGORY_OPENABLE)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
             .setType("*/*")
         startActivityForResult(intent, REQ_ABRIR)
     }
@@ -165,7 +200,7 @@ class MainActivity : Activity() {
             if (i.action == Intent.ACTION_SEND) aviso("Compartí un archivo de texto, no un texto suelto")
             return
         }
-        if (trabajando) {
+        if (Estado.trabajando) {
             aviso("Hay una operación en curso. Esperá a que termine.")
             return
         }
@@ -178,27 +213,45 @@ class MainActivity : Activity() {
         else i.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
 
     private fun cargarArchivo(uri: Uri) {
-        descartarResultado()
-        archivoUri = uri
-        archivoNombre = uri.lastPathSegment ?: "archivo"
-        archivoTam = -1L
+        Estado.limpiarResultado()
+
+        // Permiso persistente: sigue valiendo aunque la app se cierre en segundo plano.
+        // (Los archivos recibidos desde "Compartir" no lo permiten; en ese caso se ignora.)
+        try {
+            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            val anterior = Estado.archivoUri
+            if (anterior != null && anterior != uri) {
+                try {
+                    contentResolver.releasePersistableUriPermission(anterior, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                } catch (e: Exception) {
+                    // no es grave
+                }
+            }
+        } catch (e: Exception) {
+            // no es grave
+        }
+
+        var nombre = uri.lastPathSegment ?: "archivo"
+        var tam = -1L
         try {
             contentResolver.query(uri, null, null, null, null)?.use { c ->
                 if (c.moveToFirst()) {
                     val iNombre = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
                     val iTam = c.getColumnIndex(OpenableColumns.SIZE)
-                    if (iNombre >= 0 && !c.isNull(iNombre)) archivoNombre = c.getString(iNombre)
-                    if (iTam >= 0 && !c.isNull(iTam)) archivoTam = c.getLong(iTam)
+                    if (iNombre >= 0 && !c.isNull(iNombre)) nombre = c.getString(iNombre)
+                    if (iTam >= 0 && !c.isNull(iTam)) tam = c.getLong(iTam)
                 }
             }
         } catch (e: Exception) {
             // Si no se puede leer el nombre o el tamaño, se sigue igual.
         }
-        val tam = if (archivoTam >= 0) " (${formatoTamano(archivoTam)})" else ""
-        tvArchivo.text = "Archivo cargado: $archivoNombre$tam"
-        tvEstado.text = ""
-        barra.progress = 0
-        barra.visibility = View.INVISIBLE
+
+        Estado.archivoUri = uri
+        Estado.archivoNombre = nombre
+        Estado.archivoTam = tam
+        Estado.progreso = 0
+        Estado.mensaje = ""
+        pintar()
     }
 
     @Deprecated("Se mantiene para no depender de librerías externas")
@@ -209,15 +262,15 @@ class MainActivity : Activity() {
 
         when (requestCode) {
             REQ_ABRIR -> cargarArchivo(uri)
-            REQ_GUARDAR -> guardar(uri)
+            REQ_GUARDAR -> iniciarGuardado(uri)
         }
     }
 
     // ---------------------------------------------------------------- buscar
 
     private fun alPulsarBuscar() {
-        if (trabajando) return
-        val entrada = archivoUri
+        if (Estado.trabajando) return
+        val entrada = Estado.archivoUri
         if (entrada == null) {
             aviso("Primero elegí un archivo")
             return
@@ -228,15 +281,29 @@ class MainActivity : Activity() {
             aviso("Escribí al menos una palabra a buscar")
             return
         }
-        val b = Busqueda(
-            palabras = palabras,
-            todas = rbTodas.isChecked,
-            mayus = mayus,
-            excluidas = separar(etExcluir.text.toString(), mayus),
-            latin1 = cbLatin1.isChecked
-        )
-        descartarResultado()
-        iniciar(entrada, b)
+        val excluidas = separar(etExcluir.text.toString(), mayus)
+
+        Estado.limpiarResultado()
+        Estado.cancelar = false
+        Estado.trabajando = true
+        Estado.progreso = 0
+        Estado.indeterminada = Estado.archivoTam <= 0
+        Estado.mensaje = "Procesando…"
+
+        val i = Intent(this, TrabajoService::class.java)
+            .setAction(TrabajoService.ACCION_BUSCAR)
+            .putExtra(TrabajoService.EXTRA_ENTRADA, entrada.toString())
+            .putExtra(TrabajoService.EXTRA_PALABRAS, palabras.toTypedArray())
+            .putExtra(TrabajoService.EXTRA_EXCLUIDAS, excluidas.toTypedArray())
+            .putExtra(TrabajoService.EXTRA_TODAS, rbTodas.isChecked)
+            .putExtra(TrabajoService.EXTRA_MAYUS, mayus)
+            .putExtra(TrabajoService.EXTRA_LATIN1, cbLatin1.isChecked)
+            .putExtra(TrabajoService.EXTRA_TOTAL, Estado.archivoTam)
+
+        if (arrancarServicio(i)) {
+            pedirPermisoNotificaciones()
+        }
+        pintar()
     }
 
     private fun separar(texto: String, mayus: Boolean): List<String> =
@@ -245,138 +312,39 @@ class MainActivity : Activity() {
             .filter { it.isNotEmpty() }
             .map { if (mayus) it else it.lowercase() }
 
-    private fun iniciar(entrada: Uri, b: Busqueda) {
-        val temp: File
-        try {
-            temp = File.createTempFile("resultados", ".tmp", cacheDir)
-        } catch (e: IOException) {
-            aviso("No se pudo crear un archivo temporal: ${e.message}")
-            return
+    /** Inicia el servicio en primer plano. Si no se puede, deja un mensaje y devuelve false. */
+    private fun arrancarServicio(i: Intent): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+            true
+        } catch (e: Exception) {
+            Estado.trabajando = false
+            Estado.mensaje = "No se pudo iniciar el trabajo en segundo plano: ${e.message}"
+            false
         }
-        trabajando = true
-        cancelar = false
-        pantallaOcupada(true, archivoTam <= 0, "Procesando…")
-        val total = archivoTam
-        thread(name = "buscador") { buscar(entrada, temp, b, total) }
     }
 
-    private fun buscar(entrada: Uri, temp: File, b: Busqueda, total: Long) {
-        val inicio = System.nanoTime()
-        val nf = NumberFormat.getInstance()
-        val previa = ArrayList<String>()
-        var lineas = 0L
-        var coinc = 0L
-        var error: String? = null
-        var cancelado = false
-
-        try {
-            val flujoEntrada = contentResolver.openInputStream(entrada)
-                ?: throw IOException("No se pudo abrir el archivo")
-
-            val contador = ContadorBytes(flujoEntrada)
-            val charset = if (b.latin1) Charsets.ISO_8859_1 else Charsets.UTF_8
-
-            BufferedReader(
-                InputStreamReader(BufferedInputStream(contador, 1 shl 20), charset),
-                1 shl 20
-            ).use { lector ->
-                BufferedWriter(OutputStreamWriter(temp.outputStream(), Charsets.UTF_8), 1 shl 20).use { escritor ->
-                    var ultimoAviso = System.nanoTime()
-
-                    while (true) {
-                        val linea = lector.readLine() ?: break
-                        lineas++
-
-                        val base = if (b.mayus) linea else linea.lowercase()
-                        val encontrada =
-                            if (b.todas) b.palabras.all { base.contains(it) }
-                            else b.palabras.any { base.contains(it) }
-
-                        if (encontrada && b.excluidas.none { base.contains(it) }) {
-                            escritor.write(linea)
-                            escritor.newLine()
-                            coinc++
-                            if (previa.size < PREVIA_MAX) {
-                                previa.add(
-                                    if (linea.length > PREVIA_ANCHO) linea.take(PREVIA_ANCHO) + "…" else linea
-                                )
-                            }
-                        }
-
-                        if ((lineas and 0xFFFL) == 0L) {
-                            if (cancelar) {
-                                cancelado = true
-                                break
-                            }
-                            val ahora = System.nanoTime()
-                            if (ahora - ultimoAviso > 250_000_000L) {
-                                ultimoAviso = ahora
-                                val c = coinc
-                                val pct = if (total > 0)
-                                    (contador.total * 1000 / total).toInt().coerceIn(0, 1000)
-                                else 0
-                                val texto = if (total > 0)
-                                    "Procesando… ${"%.1f".format(pct / 10.0)} %  |  coincidencias: ${nf.format(c)}"
-                                else
-                                    "Procesando…  |  coincidencias: ${nf.format(c)}"
-                                runOnUiThread {
-                                    barra.progress = pct
-                                    tvEstado.text = texto
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (e: OutOfMemoryError) {
-            error = "Hay una línea demasiado larga para procesar (el archivo casi no tiene saltos de línea)."
-        } catch (e: Exception) {
-            error = e.message ?: e.javaClass.simpleName
-        }
-
-        val segundos = (System.nanoTime() - inicio) / 1e9
-
-        runOnUiThread {
-            trabajando = false
-            pantallaOcupada(false)
-
-            if (error != null) {
-                temp.delete()
-                tvEstado.text = "Error: $error"
-            } else if (coinc == 0L) {
-                temp.delete()
-                tvEstado.text = "No se encontró ninguna coincidencia (${nf.format(lineas)} líneas revisadas)."
-            } else {
-                resultadoTemp = temp
-                resultadoCoinc = coinc
-                if (!cancelado) barra.progress = 1000
-                val titulo = if (cancelado) "Búsqueda cancelada. Se conservan los resultados parciales."
-                else "Búsqueda terminada."
-                tvEstado.text = "$titulo\n" +
-                    "Tiempo: ${"%.1f".format(segundos)} s\n" +
-                    "Líneas revisadas: ${nf.format(lineas)}\n" +
-                    "Coincidencias: ${nf.format(coinc)}\n" +
-                    "Revisá la vista previa y tocá \"Guardar .txt\"."
-                mostrarPrevia(previa, b)
-            }
+    /** En Android 13 o más hay que pedir permiso para mostrar la notificación de progreso. */
+    private fun pedirPermisoNotificaciones() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIFICACIONES)
         }
     }
 
     // ---------------------------------------------------------------- vista previa
 
-    private fun mostrarPrevia(lineas: List<String>, b: Busqueda) {
+    private fun mostrarPrevia() {
         val nf = NumberFormat.getInstance()
-        val total = resultadoCoinc
+        val total = Estado.resultadoCoinc
+        val n = Estado.previa.size
         tvPreviaTitulo.text =
-            if (total > lineas.size)
-                "Vista previa: primeras ${nf.format(lineas.size)} de ${nf.format(total)} coincidencias"
+            if (total > n)
+                "Vista previa: primeras ${nf.format(n)} de ${nf.format(total)} coincidencias"
             else
                 "Vista previa: ${nf.format(total)} coincidencias"
-        tvPrevia.text = armarPrevia(lineas, b.palabras, b.mayus)
-        llAcciones.visibility = View.VISIBLE
-        btnCopiar.visibility = View.VISIBLE
-        tvPreviaTitulo.visibility = View.VISIBLE
-        tvPrevia.visibility = View.VISIBLE
+        tvPrevia.text = armarPrevia(Estado.previa, Estado.previaPalabras, Estado.previaMayus)
     }
 
     /** Arma el texto de la vista previa resaltando en amarillo las palabras buscadas. */
@@ -415,27 +383,16 @@ class MainActivity : Activity() {
         aviso("Copiadas ${texto.lines().size} líneas de la vista previa")
     }
 
-    private fun descartarResultado() {
-        resultadoTemp?.delete()
-        resultadoTemp = null
-        resultadoCoinc = 0L
-        tvPrevia.text = ""
-        tvPrevia.visibility = View.GONE
-        tvPreviaTitulo.visibility = View.GONE
-        llAcciones.visibility = View.GONE
-        btnCopiar.visibility = View.GONE
-    }
-
     // ---------------------------------------------------------------- guardar
 
     private fun alPulsarGuardar() {
-        if (trabajando) return
-        if (resultadoTemp == null) {
+        if (Estado.trabajando) return
+        if (Estado.resultadoTemp == null) {
             aviso("No hay resultados para guardar")
             return
         }
         // El usuario elige dónde guardar el .txt con los resultados.
-        val base = archivoNombre.substringBeforeLast('.', archivoNombre)
+        val base = Estado.archivoNombre.substringBeforeLast('.', Estado.archivoNombre)
         val intent = Intent(Intent.ACTION_CREATE_DOCUMENT)
             .addCategory(Intent.CATEGORY_OPENABLE)
             .setType("text/plain")
@@ -443,116 +400,26 @@ class MainActivity : Activity() {
         startActivityForResult(intent, REQ_GUARDAR)
     }
 
-    private fun guardar(salida: Uri) {
-        val temp = resultadoTemp ?: return
-        val coincidencias = resultadoCoinc
-        trabajando = true
-        cancelar = false
-        pantallaOcupada(true, false, "Guardando…")
+    private fun iniciarGuardado(salida: Uri) {
+        val temp = Estado.resultadoTemp ?: return
 
-        thread(name = "guardador") {
-            val nf = NumberFormat.getInstance()
-            val total = temp.length()
-            var error: String? = null
-            var cancelado = false
+        Estado.cancelar = false
+        Estado.trabajando = true
+        Estado.progreso = 0
+        Estado.indeterminada = false
+        Estado.mensaje = "Guardando…"
 
-            try {
-                val flujoSalida = contentResolver.openOutputStream(salida, "w")
-                    ?: throw IOException("No se pudo crear el archivo de resultados")
+        val i = Intent(this, TrabajoService::class.java)
+            .setAction(TrabajoService.ACCION_GUARDAR)
+            .putExtra(TrabajoService.EXTRA_SALIDA, salida.toString())
+            .putExtra(TrabajoService.EXTRA_TEMP, temp.absolutePath)
+            .putExtra(TrabajoService.EXTRA_COINC, Estado.resultadoCoinc)
 
-                temp.inputStream().buffered(1 shl 20).use { origen ->
-                    flujoSalida.buffered(1 shl 20).use { destino ->
-                        val buffer = ByteArray(1 shl 16)
-                        var copiado = 0L
-                        var ultimoAviso = System.nanoTime()
-
-                        while (true) {
-                            val n = origen.read(buffer)
-                            if (n < 0) break
-                            destino.write(buffer, 0, n)
-                            copiado += n
-
-                            if (cancelar) {
-                                cancelado = true
-                                break
-                            }
-                            val ahora = System.nanoTime()
-                            if (ahora - ultimoAviso > 250_000_000L) {
-                                ultimoAviso = ahora
-                                val pct = if (total > 0)
-                                    (copiado * 1000 / total).toInt().coerceIn(0, 1000)
-                                else 0
-                                runOnUiThread {
-                                    barra.progress = pct
-                                    tvEstado.text = "Guardando… ${"%.1f".format(pct / 10.0)} %"
-                                }
-                            }
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                error = e.message ?: e.javaClass.simpleName
-            }
-
-            // Si falló o se canceló, no dejamos un archivo incompleto.
-            if (error != null || cancelado) {
-                try {
-                    DocumentsContract.deleteDocument(contentResolver, salida)
-                } catch (e: Exception) {
-                    // Si no se puede borrar, queda el archivo parcial; no es grave.
-                }
-            }
-
-            val nombre = if (error == null && !cancelado) nombreDe(salida) else ""
-
-            runOnUiThread {
-                trabajando = false
-                pantallaOcupada(false)
-
-                if (error != null) {
-                    tvEstado.text = "Error al guardar: $error"
-                } else if (cancelado) {
-                    tvEstado.text = "Guardado cancelado. Podés intentarlo de nuevo."
-                } else {
-                    barra.progress = 1000
-                    descartarResultado()
-                    tvEstado.text = "Listo. Se guardaron ${nf.format(coincidencias)} coincidencias.\n" +
-                        "Archivo: $nombre"
-                }
-            }
-        }
+        arrancarServicio(i)
+        pintar()
     }
 
     // ---------------------------------------------------------------- utilidades
-
-    private fun pantallaOcupada(ocupado: Boolean, indeterminada: Boolean = false, texto: String = "") {
-        btnElegir.isEnabled = !ocupado
-        btnBuscar.isEnabled = !ocupado
-        btnGuardar.isEnabled = !ocupado
-        btnDescartar.isEnabled = !ocupado
-        btnCopiar.isEnabled = !ocupado
-        etBuscar.isEnabled = !ocupado
-        etExcluir.isEnabled = !ocupado
-        cbMayus.isEnabled = !ocupado
-        cbLatin1.isEnabled = !ocupado
-        findViewById<View>(R.id.rbCualquiera).isEnabled = !ocupado
-        rbTodas.isEnabled = !ocupado
-
-        btnCancelar.visibility = if (ocupado) View.VISIBLE else View.GONE
-        btnCancelar.isEnabled = true
-
-        barra.visibility = if (ocupado || barra.progress > 0) View.VISIBLE else View.INVISIBLE
-        barra.isIndeterminate = ocupado && indeterminada
-        if (ocupado) {
-            barra.progress = 0
-            tvEstado.text = texto
-            // Evita que la pantalla se apague y se corte la operación.
-            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        } else {
-            barra.isIndeterminate = false
-            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        }
-    }
 
     /** Borra temporales que hayan quedado de una sesión anterior. */
     private fun limpiarTemporales() {
@@ -565,41 +432,10 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun nombreDe(uri: Uri): String {
-        try {
-            contentResolver.query(uri, null, null, null, null)?.use { c ->
-                if (c.moveToFirst()) {
-                    val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    if (i >= 0) return c.getString(i) ?: uri.lastPathSegment.orEmpty()
-                }
-            }
-        } catch (e: Exception) {
-            // se usa el nombre por defecto
-        }
-        return uri.lastPathSegment.orEmpty()
-    }
-
     private fun formatoTamano(bytes: Long): String {
         val mb = bytes / (1024.0 * 1024.0)
         return if (mb >= 1024) "%.2f GB".format(mb / 1024.0) else "%.1f MB".format(mb)
     }
 
     private fun aviso(texto: String) = Toast.makeText(this, texto, Toast.LENGTH_SHORT).show()
-}
-
-/** Cuenta los bytes leídos para poder mostrar el avance en porcentaje. */
-private class ContadorBytes(entrada: InputStream) : FilterInputStream(entrada) {
-    @Volatile var total = 0L
-
-    override fun read(): Int {
-        val b = super.read()
-        if (b >= 0) total++
-        return b
-    }
-
-    override fun read(b: ByteArray, off: Int, len: Int): Int {
-        val n = super.read(b, off, len)
-        if (n > 0) total += n
-        return n
-    }
 }
