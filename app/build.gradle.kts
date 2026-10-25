@@ -3,6 +3,10 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// Clave de firma fija. El flujo de GitHub la reconstruye a partir de app/filtro.jks.b64.
+// Con la misma clave, Android instala cada versión nueva como una actualización.
+val claveFija = file("filtro.jks")
+
 android {
     namespace = "com.filtrotexto.app"
     compileSdk = 34
@@ -15,7 +19,23 @@ android {
         versionName = "1.0"
     }
 
+    signingConfigs {
+        create("fija") {
+            if (claveFija.exists()) {
+                storeFile = claveFija
+                storePassword = "android"
+                keyAlias = "filtro"
+                keyPassword = "android"
+            }
+        }
+    }
+
     buildTypes {
+        debug {
+            if (claveFija.exists()) {
+                signingConfig = signingConfigs.getByName("fija")
+            }
+        }
         release {
             isMinifyEnabled = false
         }
