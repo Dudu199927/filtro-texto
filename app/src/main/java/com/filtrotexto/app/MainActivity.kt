@@ -1,16 +1,24 @@
 package com.filtrotexto.app
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.BackgroundColorSpan
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.RadioButton
 import android.widget.TextView
@@ -18,6 +26,7 @@ import android.widget.Toast
 import java.io.BufferedInputStream
 import java.io.BufferedReader
 import java.io.BufferedWriter
+import java.io.File
 import java.io.FilterInputStream
 import java.io.IOException
 import java.io.InputStream
@@ -28,14 +37,20 @@ import kotlin.concurrent.thread
 
 /**
  * Filtro de texto para archivos grandes.
- * Lee el archivo línea por línea (streaming), por lo que casi no usa memoria
- * aunque el archivo pese varios GB.
+ *
+ * - Lee el archivo línea por línea (streaming), por lo que casi no usa memoria
+ *   aunque el archivo pese varios GB.
+ * - Los resultados se guardan primero en un archivo temporal y se muestra una
+ *   vista previa; recién al tocar "Guardar .txt" se exportan.
+ * - Recibe archivos desde "Compartir" y "Abrir con" de otras apps.
  */
 class MainActivity : Activity() {
 
     private companion object {
         const val REQ_ABRIR = 1
         const val REQ_GUARDAR = 2
+        const val PREVIA_MAX = 200
+        const val PREVIA_ANCHO = 400
     }
 
     private class Busqueda(
@@ -49,8 +64,14 @@ class MainActivity : Activity() {
     private lateinit var btnElegir: Button
     private lateinit var btnBuscar: Button
     private lateinit var btnCancelar: Button
+    private lateinit var btnGuardar: Button
+    private lateinit var btnDescartar: Button
+    private lateinit var btnCopiar: Button
+    private lateinit var llAcciones: LinearLayout
     private lateinit var tvArchivo: TextView
     private lateinit var tvEstado: TextView
+    private lateinit var tvPreviaTitulo: TextView
+    private lateinit var tvPrevia: TextView
     private lateinit var etBuscar: EditText
     private lateinit var etExcluir: EditText
     private lateinit var rbTodas: RadioButton
@@ -61,7 +82,9 @@ class MainActivity : Activity() {
     private var archivoUri: Uri? = null
     private var archivoNombre = ""
     private var archivoTam = -1L
-    private var pendiente: Busqueda? = null
+
+    private var resultadoTemp: File? = null
+    private var resultadoCoinc = 0L
 
     @Volatile private var cancelar = false
     @Volatile private var trabajando = false
@@ -70,11 +93,19 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        limpiarTemporales()
+
         btnElegir = findViewById(R.id.btnElegir)
         btnBuscar = findViewById(R.id.btnBuscar)
         btnCancelar = findViewById(R.id.btnCancelar)
+        btnGuardar = findViewById(R.id.btnGuardar)
+        btnDescartar = findViewById(R.id.btnDescartar)
+        btnCopiar = findViewById(R.id.btnCopiar)
+        llAcciones = findViewById(R.id.llAcciones)
         tvArchivo = findViewById(R.id.tvArchivo)
         tvEstado = findViewById(R.id.tvEstado)
+        tvPreviaTitulo = findViewById(R.id.tvPreviaTitulo)
+        tvPrevia = findViewById(R.id.tvPrevia)
         etBuscar = findViewById(R.id.etBuscar)
         etExcluir = findViewById(R.id.etExcluir)
         rbTodas = findViewById(R.id.rbTodas)
@@ -84,14 +115,35 @@ class MainActivity : Activity() {
 
         btnElegir.setOnClickListener { elegirArchivo() }
         btnBuscar.setOnClickListener { alPulsarBuscar() }
+        btnGuardar.setOnClickListener { alPulsarGuardar() }
+        btnCopiar.setOnClickListener { copiarPrevia() }
+        btnDescartar.setOnClickListener {
+            descartarResultado()
+            barra.progress = 0
+            barra.visibility = View.INVISIBLE
+            tvEstado.text = "Resultados descartados."
+        }
         btnCancelar.setOnClickListener {
             cancelar = true
             btnCancelar.isEnabled = false
             tvEstado.text = "Cancelando…"
         }
+
+        manejarIntent(intent)
     }
 
-    // ---------------------------------------------------------------- elegir archivo
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        manejarIntent(intent)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        if (isFinishing) resultadoTemp?.delete()
+    }
+
+    // ---------------------------------------------------------------- elegir / recibir archivo
 
     private fun elegirArchivo() {
         if (trabajando) return
@@ -101,6 +153,54 @@ class MainActivity : Activity() {
         startActivityForResult(intent, REQ_ABRIR)
     }
 
+    /** Archivo recibido desde "Compartir" o "Abrir con" en otra app. */
+    private fun manejarIntent(i: Intent?) {
+        if (i == null) return
+        val uri: Uri? = when (i.action) {
+            Intent.ACTION_SEND -> uriCompartida(i)
+            Intent.ACTION_VIEW -> i.data
+            else -> null
+        }
+        if (uri == null) {
+            if (i.action == Intent.ACTION_SEND) aviso("Compartí un archivo de texto, no un texto suelto")
+            return
+        }
+        if (trabajando) {
+            aviso("Hay una operación en curso. Esperá a que termine.")
+            return
+        }
+        cargarArchivo(uri)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun uriCompartida(i: Intent): Uri? =
+        if (Build.VERSION.SDK_INT >= 33) i.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+        else i.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+
+    private fun cargarArchivo(uri: Uri) {
+        descartarResultado()
+        archivoUri = uri
+        archivoNombre = uri.lastPathSegment ?: "archivo"
+        archivoTam = -1L
+        try {
+            contentResolver.query(uri, null, null, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    val iNombre = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    val iTam = c.getColumnIndex(OpenableColumns.SIZE)
+                    if (iNombre >= 0 && !c.isNull(iNombre)) archivoNombre = c.getString(iNombre)
+                    if (iTam >= 0 && !c.isNull(iTam)) archivoTam = c.getLong(iTam)
+                }
+            }
+        } catch (e: Exception) {
+            // Si no se puede leer el nombre o el tamaño, se sigue igual.
+        }
+        val tam = if (archivoTam >= 0) " (${formatoTamano(archivoTam)})" else ""
+        tvArchivo.text = "Archivo cargado: $archivoNombre$tam"
+        tvEstado.text = ""
+        barra.progress = 0
+        barra.visibility = View.INVISIBLE
+    }
+
     @Deprecated("Se mantiene para no depender de librerías externas")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
@@ -108,33 +208,8 @@ class MainActivity : Activity() {
         val uri = data?.data ?: return
 
         when (requestCode) {
-            REQ_ABRIR -> {
-                archivoUri = uri
-                archivoNombre = "archivo"
-                archivoTam = -1L
-                try {
-                    contentResolver.query(uri, null, null, null, null)?.use { c ->
-                        if (c.moveToFirst()) {
-                            val iNombre = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                            val iTam = c.getColumnIndex(OpenableColumns.SIZE)
-                            if (iNombre >= 0) archivoNombre = c.getString(iNombre) ?: "archivo"
-                            if (iTam >= 0 && !c.isNull(iTam)) archivoTam = c.getLong(iTam)
-                        }
-                    }
-                } catch (e: Exception) {
-                    // Si no se puede leer el nombre o el tamaño, se sigue igual.
-                }
-                val tam = if (archivoTam >= 0) " (${formatoTamano(archivoTam)})" else ""
-                tvArchivo.text = "Archivo cargado: $archivoNombre$tam"
-                tvEstado.text = ""
-                barra.visibility = View.INVISIBLE
-            }
-
-            REQ_GUARDAR -> {
-                val b = pendiente ?: return
-                val entrada = archivoUri ?: return
-                iniciar(entrada, uri, b)
-            }
+            REQ_ABRIR -> cargarArchivo(uri)
+            REQ_GUARDAR -> guardar(uri)
         }
     }
 
@@ -142,7 +217,8 @@ class MainActivity : Activity() {
 
     private fun alPulsarBuscar() {
         if (trabajando) return
-        if (archivoUri == null) {
+        val entrada = archivoUri
+        if (entrada == null) {
             aviso("Primero elegí un archivo")
             return
         }
@@ -152,21 +228,15 @@ class MainActivity : Activity() {
             aviso("Escribí al menos una palabra a buscar")
             return
         }
-        pendiente = Busqueda(
+        val b = Busqueda(
             palabras = palabras,
             todas = rbTodas.isChecked,
             mayus = mayus,
             excluidas = separar(etExcluir.text.toString(), mayus),
             latin1 = cbLatin1.isChecked
         )
-
-        // El usuario elige dónde guardar el .txt con los resultados.
-        val base = archivoNombre.substringBeforeLast('.', archivoNombre)
-        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT)
-            .addCategory(Intent.CATEGORY_OPENABLE)
-            .setType("text/plain")
-            .putExtra(Intent.EXTRA_TITLE, "resultados_$base.txt")
-        startActivityForResult(intent, REQ_GUARDAR)
+        descartarResultado()
+        iniciar(entrada, b)
     }
 
     private fun separar(texto: String, mayus: Boolean): List<String> =
@@ -175,17 +245,25 @@ class MainActivity : Activity() {
             .filter { it.isNotEmpty() }
             .map { if (mayus) it else it.lowercase() }
 
-    private fun iniciar(entrada: Uri, salida: Uri, b: Busqueda) {
+    private fun iniciar(entrada: Uri, b: Busqueda) {
+        val temp: File
+        try {
+            temp = File.createTempFile("resultados", ".tmp", cacheDir)
+        } catch (e: IOException) {
+            aviso("No se pudo crear un archivo temporal: ${e.message}")
+            return
+        }
         trabajando = true
         cancelar = false
-        pantallaOcupada(true)
+        pantallaOcupada(true, archivoTam <= 0, "Procesando…")
         val total = archivoTam
-        thread(name = "buscador") { buscar(entrada, salida, b, total) }
+        thread(name = "buscador") { buscar(entrada, temp, b, total) }
     }
 
-    private fun buscar(entrada: Uri, salida: Uri, b: Busqueda, total: Long) {
+    private fun buscar(entrada: Uri, temp: File, b: Busqueda, total: Long) {
         val inicio = System.nanoTime()
         val nf = NumberFormat.getInstance()
+        val previa = ArrayList<String>()
         var lineas = 0L
         var coinc = 0L
         var error: String? = null
@@ -194,8 +272,6 @@ class MainActivity : Activity() {
         try {
             val flujoEntrada = contentResolver.openInputStream(entrada)
                 ?: throw IOException("No se pudo abrir el archivo")
-            val flujoSalida = contentResolver.openOutputStream(salida, "w")
-                ?: throw IOException("No se pudo crear el archivo de resultados")
 
             val contador = ContadorBytes(flujoEntrada)
             val charset = if (b.latin1) Charsets.ISO_8859_1 else Charsets.UTF_8
@@ -204,7 +280,7 @@ class MainActivity : Activity() {
                 InputStreamReader(BufferedInputStream(contador, 1 shl 20), charset),
                 1 shl 20
             ).use { lector ->
-                BufferedWriter(OutputStreamWriter(flujoSalida, Charsets.UTF_8), 1 shl 20).use { escritor ->
+                BufferedWriter(OutputStreamWriter(temp.outputStream(), Charsets.UTF_8), 1 shl 20).use { escritor ->
                     var ultimoAviso = System.nanoTime()
 
                     while (true) {
@@ -220,6 +296,11 @@ class MainActivity : Activity() {
                             escritor.write(linea)
                             escritor.newLine()
                             coinc++
+                            if (previa.size < PREVIA_MAX) {
+                                previa.add(
+                                    if (linea.length > PREVIA_ANCHO) linea.take(PREVIA_ANCHO) + "…" else linea
+                                )
+                            }
                         }
 
                         if ((lineas and 0xFFFL) == 0L) {
@@ -255,42 +336,201 @@ class MainActivity : Activity() {
 
         val segundos = (System.nanoTime() - inicio) / 1e9
 
-        // Sin coincidencias no dejamos un archivo vacío.
-        if (coinc == 0L) {
-            try {
-                DocumentsContract.deleteDocument(contentResolver, salida)
-            } catch (e: Exception) {
-                // Si no se puede borrar, queda el archivo vacío; no es grave.
-            }
-        }
-
-        val mensaje = when {
-            error != null -> "Error: $error"
-            coinc == 0L -> "No se encontró ninguna coincidencia (${nf.format(lineas)} líneas revisadas). " +
-                "No se creó ningún archivo."
-            else -> {
-                val titulo = if (cancelado) "Cancelado. Se guardaron los resultados parciales." else "Listo."
-                "$titulo\n" +
-                    "Tiempo: ${"%.1f".format(segundos)} s\n" +
-                    "Líneas revisadas: ${nf.format(lineas)}\n" +
-                    "Coincidencias exportadas: ${nf.format(coinc)}\n" +
-                    "Archivo: ${nombreDe(salida)}"
-            }
-        }
-
         runOnUiThread {
             trabajando = false
             pantallaOcupada(false)
-            if (error == null && !cancelado) barra.progress = 1000
-            tvEstado.text = mensaje
+
+            if (error != null) {
+                temp.delete()
+                tvEstado.text = "Error: $error"
+            } else if (coinc == 0L) {
+                temp.delete()
+                tvEstado.text = "No se encontró ninguna coincidencia (${nf.format(lineas)} líneas revisadas)."
+            } else {
+                resultadoTemp = temp
+                resultadoCoinc = coinc
+                if (!cancelado) barra.progress = 1000
+                val titulo = if (cancelado) "Búsqueda cancelada. Se conservan los resultados parciales."
+                else "Búsqueda terminada."
+                tvEstado.text = "$titulo\n" +
+                    "Tiempo: ${"%.1f".format(segundos)} s\n" +
+                    "Líneas revisadas: ${nf.format(lineas)}\n" +
+                    "Coincidencias: ${nf.format(coinc)}\n" +
+                    "Revisá la vista previa y tocá \"Guardar .txt\"."
+                mostrarPrevia(previa, b)
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- vista previa
+
+    private fun mostrarPrevia(lineas: List<String>, b: Busqueda) {
+        val nf = NumberFormat.getInstance()
+        val total = resultadoCoinc
+        tvPreviaTitulo.text =
+            if (total > lineas.size)
+                "Vista previa: primeras ${nf.format(lineas.size)} de ${nf.format(total)} coincidencias"
+            else
+                "Vista previa: ${nf.format(total)} coincidencias"
+        tvPrevia.text = armarPrevia(lineas, b.palabras, b.mayus)
+        llAcciones.visibility = View.VISIBLE
+        btnCopiar.visibility = View.VISIBLE
+        tvPreviaTitulo.visibility = View.VISIBLE
+        tvPrevia.visibility = View.VISIBLE
+    }
+
+    /** Arma el texto de la vista previa resaltando en amarillo las palabras buscadas. */
+    private fun armarPrevia(lineas: List<String>, palabras: List<String>, mayus: Boolean): CharSequence {
+        val sb = SpannableStringBuilder()
+        for (l in lineas) {
+            val inicio = sb.length
+            sb.append(l).append('\n')
+            val base = if (mayus) l else l.lowercase()
+            if (base.length != l.length) continue
+            for (p in palabras) {
+                var i = base.indexOf(p)
+                while (i >= 0) {
+                    sb.setSpan(
+                        BackgroundColorSpan(0xFFFFEB3B.toInt()),
+                        inicio + i,
+                        inicio + i + p.length,
+                        Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                    )
+                    i = base.indexOf(p, i + p.length)
+                }
+            }
+        }
+        return sb
+    }
+
+    /** Copia al portapapeles las líneas que se ven en la vista previa. */
+    private fun copiarPrevia() {
+        val texto = tvPrevia.text.toString().trimEnd()
+        if (texto.isEmpty()) {
+            aviso("No hay vista previa para copiar")
+            return
+        }
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("Vista previa", texto))
+        aviso("Copiadas ${texto.lines().size} líneas de la vista previa")
+    }
+
+    private fun descartarResultado() {
+        resultadoTemp?.delete()
+        resultadoTemp = null
+        resultadoCoinc = 0L
+        tvPrevia.text = ""
+        tvPrevia.visibility = View.GONE
+        tvPreviaTitulo.visibility = View.GONE
+        llAcciones.visibility = View.GONE
+        btnCopiar.visibility = View.GONE
+    }
+
+    // ---------------------------------------------------------------- guardar
+
+    private fun alPulsarGuardar() {
+        if (trabajando) return
+        if (resultadoTemp == null) {
+            aviso("No hay resultados para guardar")
+            return
+        }
+        // El usuario elige dónde guardar el .txt con los resultados.
+        val base = archivoNombre.substringBeforeLast('.', archivoNombre)
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType("text/plain")
+            .putExtra(Intent.EXTRA_TITLE, "resultados_$base.txt")
+        startActivityForResult(intent, REQ_GUARDAR)
+    }
+
+    private fun guardar(salida: Uri) {
+        val temp = resultadoTemp ?: return
+        val coincidencias = resultadoCoinc
+        trabajando = true
+        cancelar = false
+        pantallaOcupada(true, false, "Guardando…")
+
+        thread(name = "guardador") {
+            val nf = NumberFormat.getInstance()
+            val total = temp.length()
+            var error: String? = null
+            var cancelado = false
+
+            try {
+                val flujoSalida = contentResolver.openOutputStream(salida, "w")
+                    ?: throw IOException("No se pudo crear el archivo de resultados")
+
+                temp.inputStream().buffered(1 shl 20).use { origen ->
+                    flujoSalida.buffered(1 shl 20).use { destino ->
+                        val buffer = ByteArray(1 shl 16)
+                        var copiado = 0L
+                        var ultimoAviso = System.nanoTime()
+
+                        while (true) {
+                            val n = origen.read(buffer)
+                            if (n < 0) break
+                            destino.write(buffer, 0, n)
+                            copiado += n
+
+                            if (cancelar) {
+                                cancelado = true
+                                break
+                            }
+                            val ahora = System.nanoTime()
+                            if (ahora - ultimoAviso > 250_000_000L) {
+                                ultimoAviso = ahora
+                                val pct = if (total > 0)
+                                    (copiado * 1000 / total).toInt().coerceIn(0, 1000)
+                                else 0
+                                runOnUiThread {
+                                    barra.progress = pct
+                                    tvEstado.text = "Guardando… ${"%.1f".format(pct / 10.0)} %"
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                error = e.message ?: e.javaClass.simpleName
+            }
+
+            // Si falló o se canceló, no dejamos un archivo incompleto.
+            if (error != null || cancelado) {
+                try {
+                    DocumentsContract.deleteDocument(contentResolver, salida)
+                } catch (e: Exception) {
+                    // Si no se puede borrar, queda el archivo parcial; no es grave.
+                }
+            }
+
+            val nombre = if (error == null && !cancelado) nombreDe(salida) else ""
+
+            runOnUiThread {
+                trabajando = false
+                pantallaOcupada(false)
+
+                if (error != null) {
+                    tvEstado.text = "Error al guardar: $error"
+                } else if (cancelado) {
+                    tvEstado.text = "Guardado cancelado. Podés intentarlo de nuevo."
+                } else {
+                    barra.progress = 1000
+                    descartarResultado()
+                    tvEstado.text = "Listo. Se guardaron ${nf.format(coincidencias)} coincidencias.\n" +
+                        "Archivo: $nombre"
+                }
+            }
         }
     }
 
     // ---------------------------------------------------------------- utilidades
 
-    private fun pantallaOcupada(ocupado: Boolean) {
+    private fun pantallaOcupada(ocupado: Boolean, indeterminada: Boolean = false, texto: String = "") {
         btnElegir.isEnabled = !ocupado
         btnBuscar.isEnabled = !ocupado
+        btnGuardar.isEnabled = !ocupado
+        btnDescartar.isEnabled = !ocupado
+        btnCopiar.isEnabled = !ocupado
         etBuscar.isEnabled = !ocupado
         etExcluir.isEnabled = !ocupado
         cbMayus.isEnabled = !ocupado
@@ -302,15 +542,26 @@ class MainActivity : Activity() {
         btnCancelar.isEnabled = true
 
         barra.visibility = if (ocupado || barra.progress > 0) View.VISIBLE else View.INVISIBLE
-        barra.isIndeterminate = ocupado && archivoTam <= 0
+        barra.isIndeterminate = ocupado && indeterminada
         if (ocupado) {
             barra.progress = 0
-            tvEstado.text = "Procesando…"
-            // Evita que la pantalla se apague y se corte la búsqueda.
+            tvEstado.text = texto
+            // Evita que la pantalla se apague y se corte la operación.
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         } else {
             barra.isIndeterminate = false
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
+    /** Borra temporales que hayan quedado de una sesión anterior. */
+    private fun limpiarTemporales() {
+        try {
+            cacheDir.listFiles()?.forEach { f ->
+                if (f.name.startsWith("resultados")) f.delete()
+            }
+        } catch (e: Exception) {
+            // no es grave
         }
     }
 
