@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Líneas de texto -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M30,36h34v5h-34z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M30,47h22v5h-22z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M30,58h14v5h-14z" />
+
+    <!-- Lupa: aro y mango -->
+    <path
+        android:pathData="M77,64a13,13 0 1,1 -26,0a13,13 0 1,1 26,0"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="5" />
+    <path
+        android:pathData="M73,73L83,83"
+        android:strokeColor="#FFFFFF"
+        android:strokeLineCap="round"
+        android:strokeWidth="5" />
+</vector>
