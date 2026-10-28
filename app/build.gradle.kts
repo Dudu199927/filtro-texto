@@ -53,5 +53,8 @@ android {
 
 dependencies {
     // Lee RAR (incluido RAR5) y 7z. Versión fija: commit del repositorio en JitPack.
-    implementation("com.github.seven332.a7zip:extract-lite:cba0ce9586")
+    implementation("com.github.seven332.a7zip:extract-lite:cba0ce9586") {
+        // ReLinker 1.4.0 ya no se descarga; lo reemplaza com/getkeepsafe/relinker/ReLinker.java
+        exclude(group = "com.getkeepsafe.relinker", module = "relinker")
+    }
 }
