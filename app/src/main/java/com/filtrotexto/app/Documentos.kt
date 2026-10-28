@@ -37,3 +37,6 @@ object Documentos {
                     if (cp != null && Character.isValidCodePoint(cp)) String(Character.toChars(cp)) else m.value
                 }
             }
+        }
+    }
+}

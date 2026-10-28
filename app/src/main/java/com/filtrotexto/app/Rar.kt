@@ -37,3 +37,26 @@ object Rar {
     }
 
     private class Envoltura(private val a: InArchive) : ArchivoRar {
+        override val cantidad: Int = a.numberOfEntries.coerceAtLeast(0)
+
+        override fun ruta(i: Int): String = a.getEntryPath(i)
+
+        override fun esDirectorio(i: Int): Boolean = a.getEntryBooleanProperty(i, PropID.IS_DIR)
+
+        override fun extraer(i: Int, salida: OutputStream) {
+            if (a.getEntryBooleanProperty(i, PropID.ENCRYPTED)) {
+                salida.close()
+                throw FormatoNoAdmitido(MSG_CLAVE)
+            }
+            try {
+                a.extractEntry(i, salida)
+            } catch (e: PasswordException) {
+                throw FormatoNoAdmitido(MSG_CLAVE)
+            } catch (e: ArchiveException) {
+                throw IOException(e.message, e)
+            }
+        }
+
+        override fun close() = a.close()
+    }
+}
