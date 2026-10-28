@@ -54,3 +54,4 @@ android {
 dependencies {
     // Lee RAR (incluido RAR5) y 7z. Versión fija: commit del repositorio en JitPack.
     implementation("com.github.seven332.a7zip:extract-lite:cba0ce9586")
+}
