@@ -43,6 +43,8 @@ object Rar {
 
         override fun esDirectorio(i: Int): Boolean = a.getEntryBooleanProperty(i, PropID.IS_DIR)
 
+        override fun tamano(i: Int): Long = a.getEntryLongProperty(i, PropID.SIZE)
+
         override fun extraer(i: Int, salida: OutputStream) {
             if (a.getEntryBooleanProperty(i, PropID.ENCRYPTED)) {
                 salida.close()
