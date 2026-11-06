@@ -57,6 +57,7 @@ class MainActivity : Activity() {
     private lateinit var rbTodas: RadioButton
     private lateinit var cbMayus: CheckBox
     private lateinit var cbLatin1: CheckBox
+    private lateinit var cbSeparar: CheckBox
     private lateinit var barra: ProgressBar
 
     /** Versión de la vista previa que ya está dibujada (para no rehacerla a cada avance). */
@@ -88,6 +89,10 @@ class MainActivity : Activity() {
         rbTodas = findViewById(R.id.rbTodas)
         cbMayus = findViewById(R.id.cbMayus)
         cbLatin1 = findViewById(R.id.cbLatin1)
+        cbSeparar = findViewById(R.id.cbSeparar)
+        cbSeparar.setOnCheckedChangeListener { _, _ ->
+            if (Estado.resultadoTemp != null) mostrarPrevia()
+        }
         barra = findViewById(R.id.barra)
 
         btnElegir.setOnClickListener { elegirArchivo() }
@@ -165,6 +170,7 @@ class MainActivity : Activity() {
         btnCopiar.visibility = visibilidad
         tvPreviaTitulo.visibility = visibilidad
         tvPrevia.visibility = visibilidad
+        cbSeparar.visibility = visibilidad
 
         if (hayResultado) {
             if (previaPintada != Estado.previaVersion) {
@@ -335,6 +341,9 @@ class MainActivity : Activity() {
 
     // ---------------------------------------------------------------- vista previa
 
+    /** Un «:» que no es el de «://» de las direcciones web. */
+    private val SEPARADOR = Regex(":(?!//)")
+
     private fun mostrarPrevia() {
         val nf = NumberFormat.getInstance()
         val total = Estado.resultadoCoinc
@@ -344,7 +353,10 @@ class MainActivity : Activity() {
                 "Vista previa: primeras ${nf.format(n)} de ${nf.format(total)} coincidencias"
             else
                 "Vista previa: ${nf.format(total)} coincidencias"
-        tvPrevia.text = armarPrevia(Estado.previa, Estado.previaPalabras, Estado.previaMayus)
+        // Con "separar", cada «:» se rodea de espacios: así, al tocar un campo, se selecciona solo ese
+        // campo y no la línea entera. El archivo que se guarda no cambia.
+        val lineas = if (cbSeparar.isChecked) Estado.previa.map { SEPARADOR.replace(it, "  :  ") } else Estado.previa
+        tvPrevia.text = armarPrevia(lineas, Estado.previaPalabras, Estado.previaMayus)
     }
 
     /** Arma el texto de la vista previa resaltando en amarillo las palabras buscadas. */
@@ -373,7 +385,7 @@ class MainActivity : Activity() {
 
     /** Copia al portapapeles las líneas que se ven en la vista previa. */
     private fun copiarPrevia() {
-        val texto = tvPrevia.text.toString().trimEnd()
+        val texto = Estado.previa.joinToString("\n").trimEnd()
         if (texto.isEmpty()) {
             aviso("No hay vista previa para copiar")
             return
