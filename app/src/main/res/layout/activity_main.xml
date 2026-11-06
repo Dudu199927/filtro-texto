@@ -147,6 +147,14 @@
             android:textStyle="bold"
             android:visibility="gone" />
 
+        <CheckBox
+            android:id="@+id/cbSeparar"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="Separar campos por «:» (para copiar cada uno)"
+            android:visibility="gone" />
+
         <TextView
             android:id="@+id/tvPrevia"
             android:layout_width="match_parent"
