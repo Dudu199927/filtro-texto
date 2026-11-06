@@ -16,6 +16,12 @@
             android:layout_height="wrap_content"
             android:text="1. Elegir archivo" />
 
+        <Button
+            android:id="@+id/btnRecientes"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Archivos recientes" />
+
         <TextView
             android:id="@+id/tvArchivo"
             android:layout_width="match_parent"
@@ -84,6 +90,12 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
             android:text="3. Buscar" />
+
+        <Button
+            android:id="@+id/btnHistorial"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Búsquedas recientes" />
 
         <Button
             android:id="@+id/btnCancelar"
