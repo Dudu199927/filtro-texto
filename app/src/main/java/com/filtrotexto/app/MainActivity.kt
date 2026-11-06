@@ -98,7 +98,7 @@ class MainActivity : Activity() {
         btnRecientes = findViewById(R.id.btnRecientes)
         btnRecientes.setOnClickListener { mostrarRecientes() }
         cbSeparar.setOnCheckedChangeListener { _, _ ->
-            if (Estado.resultadoTemp != null) mostrarPrevia()
+            if (Estado.previa.isNotEmpty()) mostrarPrevia()
         }
         barra = findViewById(R.id.barra)
 
@@ -155,7 +155,6 @@ class MainActivity : Activity() {
         btnBuscar.isEnabled = !ocupado
         btnGuardar.isEnabled = !ocupado
         btnDescartar.isEnabled = !ocupado
-        btnCopiar.isEnabled = !ocupado
         etBuscar.isEnabled = !ocupado
         etExcluir.isEnabled = !ocupado
         cbMayus.isEnabled = !ocupado
@@ -174,15 +173,19 @@ class MainActivity : Activity() {
         tvEstado.text = Estado.mensaje
 
         val hayResultado = Estado.resultadoTemp != null
-        val visibilidad = if (hayResultado) View.VISIBLE else View.GONE
-        llAcciones.visibility = visibilidad
+        // La vista previa se ve también mientras se busca ("en vivo"); Guardar solo al terminar.
+        val hayPrevia = hayResultado || (ocupado && Estado.previa.isNotEmpty())
+        llAcciones.visibility = if (hayResultado) View.VISIBLE else View.GONE
+        val visibilidad = if (hayPrevia) View.VISIBLE else View.GONE
         btnCopiar.visibility = visibilidad
         tvPreviaTitulo.visibility = visibilidad
         tvPrevia.visibility = visibilidad
         cbSeparar.visibility = visibilidad
 
-        if (hayResultado) {
-            if (previaPintada != Estado.previaVersion) {
+        if (hayPrevia) {
+            // Si el usuario está seleccionando texto, no se repinta para no cortarle la selección.
+            val seleccionando = ocupado && tvPrevia.hasSelection()
+            if (previaPintada != Estado.previaVersion && !seleccionando) {
                 mostrarPrevia()
                 previaPintada = Estado.previaVersion
             }
@@ -453,13 +456,15 @@ class MainActivity : Activity() {
 
     private fun mostrarPrevia() {
         val nf = NumberFormat.getInstance()
-        val total = Estado.resultadoCoinc
+        val enVivo = Estado.trabajando
+        val total = if (enVivo) Estado.coincVivas else Estado.resultadoCoinc
         val n = Estado.previa.size
+        val prefijo = if (enVivo) "Vista previa en vivo (sigue buscando)" else "Vista previa"
         tvPreviaTitulo.text =
             if (total > n)
-                "Vista previa: primeras ${nf.format(n)} de ${nf.format(total)} coincidencias"
+                "$prefijo: primeras ${nf.format(n)} de ${nf.format(total)} coincidencias"
             else
-                "Vista previa: ${nf.format(total)} coincidencias"
+                "$prefijo: ${nf.format(total)} coincidencias"
         // Con "separar", cada «:» se rodea de espacios: así, al tocar un campo, se selecciona solo ese
         // campo y no la línea entera. El archivo que se guarda no cambia.
         val lineas = if (cbSeparar.isChecked) Estado.previa.map { SEPARADOR.replace(it, "  :  ") } else Estado.previa

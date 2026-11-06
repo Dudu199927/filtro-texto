@@ -131,6 +131,7 @@ class TrabajoService : Service() {
         val inicio = System.nanoTime()
         val nf = NumberFormat.getInstance()
         var buscador: Buscador? = null
+        var ultimoEnvio = 0L
         var error: String? = null
 
         try {
@@ -154,6 +155,22 @@ class TrabajoService : Service() {
                             Estado.mensaje = texto
                         }
                         actualizarNotificacion(texto, pct, total <= 0)
+
+                        // Vista previa en vivo: cada 2 segundos se manda lo encontrado hasta ahora.
+                        val ahora = System.nanoTime()
+                        val b0 = buscador
+                        if (b0 != null && ahora - ultimoEnvio > 2_000_000_000L && b0.coincidencias > 0) {
+                            ultimoEnvio = ahora
+                            val copia = ArrayList(b0.previa)
+                            val n = b0.coincidencias
+                            Estado.actualizar {
+                                Estado.previa = copia
+                                Estado.coincVivas = n
+                                Estado.previaPalabras = palabras
+                                Estado.previaMayus = mayus
+                                Estado.previaVersion++
+                            }
+                        }
                     }
                 )
                 buscador = b

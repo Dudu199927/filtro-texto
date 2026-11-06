@@ -32,6 +32,9 @@ object Estado {
     var previaMayus = false
     var previaVersion = 0
 
+    /** Coincidencias encontradas hasta ahora, mientras la búsqueda sigue en marcha. */
+    var coincVivas = 0L
+
     /** Para borrar temporales viejos una sola vez por inicio de la app. */
     var temporalesLimpiados = false
 
@@ -52,6 +55,7 @@ object Estado {
         resultadoTemp?.delete()
         resultadoTemp = null
         resultadoCoinc = 0L
+        coincVivas = 0L
         previa = emptyList()
         previaVersion++
     }

@@ -5,9 +5,12 @@ import java.io.BufferedReader
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
+import java.io.IOException
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.PipedInputStream
+import java.io.PipedOutputStream
 import java.io.FilterInputStream
 import java.io.InputStream
 import java.io.InputStreamReader
@@ -39,6 +42,8 @@ interface ArchivoRar : Closeable {
     val cantidad: Int
     fun ruta(i: Int): String
     fun esDirectorio(i: Int): Boolean
+    /** Tamaño descomprimido de la entrada, o 0 si no se sabe. */
+    fun tamano(i: Int): Long
     /** Escribe el contenido de la entrada en [salida] y la cierra. */
     fun extraer(i: Int, salida: java.io.OutputStream)
 }
@@ -55,7 +60,7 @@ class Buscador(
     private val total: Long,
     private val cancelado: () -> Boolean,
     private val alAvanzar: (Int, String) -> Unit,
-    private val previaMax: Int = 200,
+    private val previaMax: Int = 500,
     private val previaAncho: Int = 400,
     private val abrirRar: ((File) -> ArchivoRar)? = null,
     private val carpetaTemp: File? = null
@@ -89,6 +94,10 @@ class Buscador(
     private val nf = NumberFormat.getInstance()
     private var rarTotal = 0
     private var rarHecho = 0
+    private var rarBytes = 0L
+    private var rarBytesTotal = 0L
+    private var rarActual = ""
+    private var mensajeFijo: String? = null
     private var copiando = false
     private var ultimoAviso = System.nanoTime()
 
@@ -282,32 +291,56 @@ class Buscador(
         if (abrir == null || carpeta == null) {
             throw FormatoNoAdmitido("Este formato (RAR / 7z) no está disponible en esta versión.")
         }
+        if (profundidad == 0) {
+            mensajeFijo = "Abriendo el archivo (puede tardar un rato)…"
+            avanzar(true)
+        }
         val rar = abrir(archivo)
+        mensajeFijo = null
         try {
             val cant = rar.cantidad
+            if (profundidad == 0) {
+                rarTotal = cant
+                rarBytes = 0
+                var suma = 0L
+                for (k in 0 until cant) if (!rar.esDirectorio(k)) suma += maxOf(0L, rar.tamano(k))
+                rarBytesTotal = suma
+            }
             for (i in 0 until cant) {
                 if (interrumpido || cancelado()) {
                     interrumpido = true
                     break
                 }
-                if (profundidad == 0) {
-                    rarTotal = cant
-                    rarHecho = i
-                }
                 if (rar.esDirectorio(i)) continue
 
                 val nombreE = rar.ruta(i).replace('\\', '/')
                 val etiqueta = if (ruta.isEmpty()) nombreE else "$ruta/$nombreE"
-                val tmp = File.createTempFile("rar", ".tmp", carpeta)
+                if (profundidad == 0) {
+                    rarHecho = i
+                    rarActual = etiqueta
+                    avanzar(true)
+                }
+                val minus = nombreE.lowercase()
+                val contenedor = minus.endsWith(".zip") || minus.endsWith(".docx") || minus.endsWith(".docm") ||
+                    minus.endsWith(".dotx") || minus.endsWith(".rar") || minus.endsWith(".7z")
                 try {
-                    rar.extraer(i, FileOutputStream(tmp))
-                    analizarExtraido(tmp, etiqueta, nombreE, profundidad)
+                    if (contenedor) {
+                        // Otro archivo comprimido adentro: necesita estar completo en disco.
+                        val tmp = File.createTempFile("rar", ".tmp", carpeta)
+                        try {
+                            rar.extraer(i, FileOutputStream(tmp))
+                            analizarExtraido(tmp, etiqueta, nombreE, profundidad)
+                        } finally {
+                            tmp.delete()
+                        }
+                        if (profundidad == 0) rarBytes += maxOf(0L, rar.tamano(i))
+                    } else {
+                        leerPorTuberia(rar, i, etiqueta, profundidad)
+                    }
                 } catch (e: FormatoNoAdmitido) {
                     throw e
                 } catch (e: Exception) {
                     omitir("$etiqueta (error al leer)")
-                } finally {
-                    tmp.delete()
                 }
                 avanzar(false)
             }
@@ -320,7 +353,77 @@ class Buscador(
             if (profundidad == 0) {
                 rarTotal = 0
                 rarHecho = 0
+                rarBytes = 0
+                rarBytesTotal = 0
             }
+        }
+    }
+
+    /**
+     * Busca en una entrada mientras se descomprime, sin guardarla entera en disco:
+     * un hilo extrae y escribe en una tubería, y este lee de ella.
+     */
+    private fun leerPorTuberia(rar: ArchivoRar, i: Int, etiqueta: String, profundidad: Int) {
+        val tuberia = PipedInputStream(1 shl 20)
+        val salida = PipedOutputStream(tuberia)
+        var fallo: Throwable? = null
+        var cortado = false
+        val hilo = Thread {
+            try {
+                rar.extraer(i, salida)
+            } catch (t: Throwable) {
+                fallo = t
+            } finally {
+                try {
+                    salida.close()
+                } catch (e: Exception) {
+                    // no es grave
+                }
+            }
+        }
+        hilo.isDaemon = true
+        hilo.start()
+        try {
+            val contado = object : FilterInputStream(tuberia) {
+                override fun read(): Int {
+                    val r = super.read()
+                    if (r >= 0 && profundidad == 0) rarBytes++
+                    return r
+                }
+
+                override fun read(b: ByteArray, off: Int, len: Int): Int {
+                    val n = super.read(b, off, len)
+                    if (n > 0 && profundidad == 0) rarBytes += n
+                    return n
+                }
+            }
+            BufferedInputStream(contado, 1 shl 16).use { b ->
+                val cab = ByteArray(CABECERA)
+                b.mark(CABECERA)
+                val n = leerCabecera(b, cab)
+                b.reset()
+                val cs = charsetDeEntrada(cab, n)
+                if (cs == null) {
+                    cortado = true
+                    omitir(etiqueta)
+                } else {
+                    archivosLeidos++
+                    buscarTexto(BufferedReader(InputStreamReader(b, cs), 1 shl 16), etiqueta)
+                    if (interrumpido) cortado = true
+                }
+            }
+        } finally {
+            try {
+                tuberia.close()
+            } catch (e: Exception) {
+                // no es grave
+            }
+            hilo.join()
+        }
+        val f = fallo
+        if (f != null && !cortado) {
+            if (f is FormatoNoAdmitido) throw f
+            throw IOException("error al extraer", f)
         }
     }
 
@@ -409,6 +512,7 @@ class Buscador(
         ultimoAviso = ahora
 
         val pct = when {
+            rarTotal > 0 && rarBytesTotal > 0 -> (rarBytes * 1000L / rarBytesTotal).toInt().coerceIn(0, 1000)
             rarTotal > 0 -> (rarHecho * 1000L / rarTotal).toInt().coerceIn(0, 1000)
             total > 0 -> (bytesLeidos() * 1000 / total).toInt().coerceIn(0, 1000)
             else -> 0
@@ -416,7 +520,8 @@ class Buscador(
         val c = nf.format(coincidencias)
         val base = when {
             copiando -> "Preparando el archivo… ${"%.1f".format(pct / 10.0)} %"
-            rarTotal > 0 -> "Procesando… archivo ${nf.format(rarHecho + 1)} de ${nf.format(rarTotal)}  |  coincidencias: $c"
+            mensajeFijo != null -> "$mensajeFijo"
+            rarTotal > 0 -> "Procesando… archivo ${nf.format(rarHecho + 1)} de ${nf.format(rarTotal)}: ${rarActual.takeLast(40)}  |  ${"%.1f".format(pct / 10.0)} %  |  coincidencias: $c"
             total > 0 -> "Procesando… ${"%.1f".format(pct / 10.0)} %  |  coincidencias: $c"
             else -> "Procesando…  |  coincidencias: $c"
         }
