@@ -2,6 +2,7 @@ package com.filtrotexto.app
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -58,6 +59,8 @@ class MainActivity : Activity() {
     private lateinit var cbMayus: CheckBox
     private lateinit var cbLatin1: CheckBox
     private lateinit var cbSeparar: CheckBox
+    private lateinit var btnHistorial: Button
+    private lateinit var btnRecientes: Button
     private lateinit var barra: ProgressBar
 
     /** Versión de la vista previa que ya está dibujada (para no rehacerla a cada avance). */
@@ -90,6 +93,10 @@ class MainActivity : Activity() {
         cbMayus = findViewById(R.id.cbMayus)
         cbLatin1 = findViewById(R.id.cbLatin1)
         cbSeparar = findViewById(R.id.cbSeparar)
+        btnHistorial = findViewById(R.id.btnHistorial)
+        btnHistorial.setOnClickListener { mostrarHistorial() }
+        btnRecientes = findViewById(R.id.btnRecientes)
+        btnRecientes.setOnClickListener { mostrarRecientes() }
         cbSeparar.setOnCheckedChangeListener { _, _ ->
             if (Estado.resultadoTemp != null) mostrarPrevia()
         }
@@ -153,6 +160,8 @@ class MainActivity : Activity() {
         etExcluir.isEnabled = !ocupado
         cbMayus.isEnabled = !ocupado
         cbLatin1.isEnabled = !ocupado
+        btnHistorial.isEnabled = !ocupado
+        btnRecientes.isEnabled = !ocupado
         rbCualquiera.isEnabled = !ocupado
         rbTodas.isEnabled = !ocupado
 
@@ -223,16 +232,10 @@ class MainActivity : Activity() {
 
         // Permiso persistente: sigue valiendo aunque la app se cierre en segundo plano.
         // (Los archivos recibidos desde "Compartir" no lo permiten; en ese caso se ignora.)
+        var persistente = false
         try {
             contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            val anterior = Estado.archivoUri
-            if (anterior != null && anterior != uri) {
-                try {
-                    contentResolver.releasePersistableUriPermission(anterior, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                } catch (e: Exception) {
-                    // no es grave
-                }
-            }
+            persistente = true
         } catch (e: Exception) {
             // no es grave
         }
@@ -255,6 +258,13 @@ class MainActivity : Activity() {
         Estado.archivoUri = uri
         Estado.archivoNombre = nombre
         Estado.archivoTam = tam
+
+        // Solo se recuerdan los archivos que Android deja volver a abrir más tarde.
+        if (persistente) {
+            for (fuera in ArchivosRecientes.guardar(this, ArchivoReciente(uri.toString(), nombre, tam))) {
+                soltarPermiso(fuera.uri)
+            }
+        }
         Estado.progreso = 0
         Estado.mensaje = ""
         pintar()
@@ -289,6 +299,14 @@ class MainActivity : Activity() {
         }
         val excluidas = separar(etExcluir.text.toString(), mayus)
 
+        Historial.guardar(
+            this,
+            Busqueda(
+                etBuscar.text.toString().trim(), etExcluir.text.toString().trim(),
+                rbTodas.isChecked, mayus, cbLatin1.isChecked
+            )
+        )
+
         Estado.limpiarResultado()
         Estado.cancelar = false
         Estado.trabajando = true
@@ -310,6 +328,95 @@ class MainActivity : Activity() {
             pedirPermisoNotificaciones()
         }
         pintar()
+    }
+
+    /** Lista los últimos archivos abiertos; al tocar uno se carga (queda listo para buscar). */
+    private fun mostrarRecientes() {
+        if (Estado.trabajando) return
+        val lista = ArchivosRecientes.leer(this)
+        if (lista.isEmpty()) {
+            aviso("Todavía no hay archivos recientes")
+            return
+        }
+        val opciones = lista.map {
+            if (it.tam >= 0) it.nombre + "\n" + formatoTamano(it.tam) else it.nombre
+        } + "Borrar la lista"
+        AlertDialog.Builder(this)
+            .setTitle("Archivos recientes")
+            .setItems(opciones.toTypedArray()) { _, cual ->
+                if (cual >= lista.size) {
+                    for (a in lista) soltarPermiso(a.uri)
+                    ArchivosRecientes.borrar(this)
+                    aviso("Lista borrada")
+                } else {
+                    abrirReciente(lista[cual])
+                }
+            }
+            .setNegativeButton("Cerrar", null)
+            .show()
+    }
+
+    private fun abrirReciente(a: ArchivoReciente) {
+        val uri = Uri.parse(a.uri)
+        val disponible = try {
+            contentResolver.openInputStream(uri)?.close()
+            true
+        } catch (e: Exception) {
+            false
+        }
+        if (!disponible) {
+            soltarPermiso(a.uri)
+            ArchivosRecientes.quitar(this, a.uri)
+            aviso("Ese archivo ya no está disponible. Elegilo de nuevo con el botón 1")
+            return
+        }
+        cargarArchivo(uri)
+    }
+
+    private fun soltarPermiso(uri: String) {
+        try {
+            if (Estado.archivoUri?.toString() == uri) return
+            contentResolver.releasePersistableUriPermission(Uri.parse(uri), Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        } catch (e: Exception) {
+            // no es grave
+        }
+    }
+
+    /** Lista las últimas búsquedas; al tocar una se completan los campos y se busca enseguida. */
+    private fun mostrarHistorial() {
+        if (Estado.trabajando) return
+        val lista = Historial.leer(this)
+        if (lista.isEmpty()) {
+            aviso("Todavía no hay búsquedas guardadas")
+            return
+        }
+        val opciones = lista.map { it.titulo() } + "Borrar el historial"
+        AlertDialog.Builder(this)
+            .setTitle("Búsquedas recientes")
+            .setItems(opciones.toTypedArray()) { _, cual ->
+                if (cual >= lista.size) {
+                    Historial.borrar(this)
+                    aviso("Historial borrado")
+                } else {
+                    usarBusqueda(lista[cual])
+                }
+            }
+            .setNegativeButton("Cerrar", null)
+            .show()
+    }
+
+    private fun usarBusqueda(b: Busqueda) {
+        etBuscar.setText(b.palabras)
+        etExcluir.setText(b.excluir)
+        rbTodas.isChecked = b.todas
+        rbCualquiera.isChecked = !b.todas
+        cbMayus.isChecked = b.mayus
+        cbLatin1.isChecked = b.latin1
+        if (Estado.archivoUri == null) {
+            aviso("Búsqueda cargada. Elegí un archivo con el botón 1 y tocá Buscar")
+        } else {
+            alPulsarBuscar()
+        }
     }
 
     private fun separar(texto: String, mayus: Boolean): List<String> =
