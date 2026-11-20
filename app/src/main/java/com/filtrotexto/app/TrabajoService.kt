@@ -117,8 +117,9 @@ class TrabajoService : Service() {
         val todas = intent.getBooleanExtra(EXTRA_TODAS, false)
         val mayus = intent.getBooleanExtra(EXTRA_MAYUS, false)
         val latin1 = intent.getBooleanExtra(EXTRA_LATIN1, false)
-        val total = intent.getLongExtra(EXTRA_TOTAL, -1L)
-        val nombre = nombreDe(entrada)
+        var total = intent.getLongExtra(EXTRA_TOTAL, -1L)
+        val esEnlace = entrada.scheme == "http" || entrada.scheme == "https"
+        var nombre = if (esEnlace) Enlaces.nombreDe(textoUri) else nombreDe(entrada)
 
         val temp: File
         try {
@@ -135,8 +136,20 @@ class TrabajoService : Service() {
         var error: String? = null
 
         try {
-            val flujoEntrada = contentResolver.openInputStream(entrada)
-                ?: throw IOException("No se pudo abrir el archivo")
+            val flujoEntrada: InputStream
+            if (esEnlace) {
+                Estado.actualizar { Estado.mensaje = "Conectando…" }
+                val d = Enlaces.abrir(textoUri)
+                flujoEntrada = d.flujo
+                if (d.tamano > 0) {
+                    total = d.tamano
+                    Estado.actualizar { Estado.indeterminada = false }
+                }
+                if (!d.nombreSugerido.isNullOrEmpty()) nombre = d.nombreSugerido
+            } else {
+                flujoEntrada = contentResolver.openInputStream(entrada)
+                    ?: throw IOException("No se pudo abrir el archivo")
+            }
             val contador = ContadorDeBytes(flujoEntrada)
             val parametros = Parametros(palabras, excluidas, todas, mayus, latin1)
 
@@ -180,6 +193,10 @@ class TrabajoService : Service() {
             error = "Hay una línea o un archivo demasiado grande para procesar."
         } catch (e: SecurityException) {
             error = "Android ya no permite leer este archivo. Elegilo de nuevo con el botón 1."
+        } catch (e: java.net.UnknownHostException) {
+            error = "No se pudo conectar. Revisá tu conexión a internet y el enlace."
+        } catch (e: java.net.SocketTimeoutException) {
+            error = "Se cortó la conexión (sin respuesta del servidor). Probá de nuevo."
         } catch (e: Exception) {
             error = e.message ?: e.javaClass.simpleName
         }

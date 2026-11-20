@@ -61,6 +61,7 @@ class MainActivity : Activity() {
     private lateinit var cbSeparar: CheckBox
     private lateinit var btnHistorial: Button
     private lateinit var btnRecientes: Button
+    private lateinit var btnEnlace: Button
     private lateinit var barra: ProgressBar
 
     /** Versión de la vista previa que ya está dibujada (para no rehacerla a cada avance). */
@@ -97,6 +98,8 @@ class MainActivity : Activity() {
         btnHistorial.setOnClickListener { mostrarHistorial() }
         btnRecientes = findViewById(R.id.btnRecientes)
         btnRecientes.setOnClickListener { mostrarRecientes() }
+        btnEnlace = findViewById(R.id.btnEnlace)
+        btnEnlace.setOnClickListener { pedirEnlace() }
         cbSeparar.setOnCheckedChangeListener { _, _ ->
             if (Estado.previa.isNotEmpty()) mostrarPrevia()
         }
@@ -148,7 +151,9 @@ class MainActivity : Activity() {
             "Ningún archivo seleccionado"
         } else {
             val tam = if (Estado.archivoTam >= 0) " (${formatoTamano(Estado.archivoTam)})" else ""
-            "Archivo cargado: ${Estado.archivoNombre}$tam"
+            val esEnlace = Estado.archivoUri?.scheme.let { it == "http" || it == "https" }
+            if (esEnlace) "Enlace cargado: ${Estado.archivoNombre} (se lee desde internet)"
+            else "Archivo cargado: ${Estado.archivoNombre}$tam"
         }
 
         btnElegir.isEnabled = !ocupado
@@ -161,6 +166,7 @@ class MainActivity : Activity() {
         cbLatin1.isEnabled = !ocupado
         btnHistorial.isEnabled = !ocupado
         btnRecientes.isEnabled = !ocupado
+        btnEnlace.isEnabled = !ocupado
         rbCualquiera.isEnabled = !ocupado
         rbTodas.isEnabled = !ocupado
 
@@ -359,7 +365,55 @@ class MainActivity : Activity() {
             .show()
     }
 
+    /** Pide un enlace de descarga y deja ese archivo listo para buscar (se lee sin guardarlo). */
+    private fun pedirEnlace() {
+        if (Estado.trabajando) return
+        val campo = EditText(this)
+        campo.hint = "https://…"
+        campo.setSingleLine(true)
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val pegado = cm.primaryClip?.getItemAt(0)?.text?.toString()?.trim()
+            if (pegado != null && Enlaces.normalizar(pegado) != null) campo.setText(pegado)
+        } catch (e: Exception) {
+            // si no se puede leer el portapapeles, se escribe a mano
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Abrir desde enlace")
+            .setMessage(
+                "Pegá el enlace de descarga. Se lee desde internet sin guardarlo en el teléfono " +
+                    "(los RAR y 7z se guardan de forma temporal). Gasta los mismos datos que descargarlo."
+            )
+            .setView(campo)
+            .setPositiveButton("Abrir") { _, _ -> cargarEnlace(campo.text.toString()) }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    private fun cargarEnlace(texto: String) {
+        val url = Enlaces.normalizar(texto)
+        if (url == null) {
+            aviso("El enlace no es válido: tiene que empezar con http:// o https://")
+            return
+        }
+        Estado.limpiarResultado()
+        val nombre = Enlaces.nombreDe(url)
+        Estado.archivoUri = Uri.parse(url)
+        Estado.archivoNombre = nombre
+        Estado.archivoTam = -1L
+        Estado.progreso = 0
+        Estado.mensaje = ""
+        for (fuera in ArchivosRecientes.guardar(this, ArchivoReciente(url, nombre, -1L))) {
+            soltarPermiso(fuera.uri)
+        }
+        pintar()
+    }
+
     private fun abrirReciente(a: ArchivoReciente) {
+        if (a.uri.startsWith("http://") || a.uri.startsWith("https://")) {
+            cargarEnlace(a.uri)
+            return
+        }
         val uri = Uri.parse(a.uri)
         val disponible = try {
             contentResolver.openInputStream(uri)?.close()
